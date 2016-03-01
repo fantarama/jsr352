@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2015 Red Hat, Inc. and/or its affiliates.
+ * Copyright (c) 2012-2014 Red Hat, Inc. and/or its affiliates.
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
@@ -14,7 +14,6 @@ package org.jberet.runtime.runner;
 
 import java.io.Serializable;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,10 +36,10 @@ import javax.batch.api.partition.PartitionMapper;
 import javax.batch.api.partition.PartitionReducer;
 import javax.batch.operations.BatchRuntimeException;
 import javax.batch.runtime.BatchStatus;
+import javax.transaction.Status;
 import javax.transaction.TransactionManager;
 
 import org.jberet._private.BatchLogger;
-import org.jberet.creation.JobScopedContextImpl;
 import org.jberet.job.model.Chunk;
 import org.jberet.job.model.Listeners;
 import org.jberet.job.model.Partition;
@@ -54,14 +53,14 @@ import org.jberet.runtime.StepExecutionImpl;
 import org.jberet.runtime.context.AbstractContext;
 import org.jberet.runtime.context.JobContextImpl;
 import org.jberet.runtime.context.StepContextImpl;
-import org.jberet.spi.JobTask;
 import org.jberet.spi.PropertyKey;
 import org.jberet.tx.LocalTransactionManager;
+import org.jberet.util.BatchUtil;
 
 import static org.jberet._private.BatchLogger.LOGGER;
 import static org.jberet._private.BatchMessages.MESSAGES;
 
-public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> implements JobTask {
+public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> implements Runnable {
     Step step;
     private final List<StepListener> stepListeners = new ArrayList<StepListener>();
     Map<String, Class<?>> chunkRelatedListeners;
@@ -71,6 +70,7 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
 
     PartitionReducer reducer;
     PartitionAnalyzer analyzer;
+    RefArtifact collectorConfig;
 
     int numOfPartitions;
     int numOfThreads;
@@ -83,8 +83,6 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
     final TransactionManager tm;
     final StepExecutionImpl stepExecution;
 
-    private boolean analyzerTxEnabled = true;
-
     public StepExecutionRunner(final StepContextImpl stepContext, final CompositeExecutionRunner enclosingRunner) {
         super(stepContext, enclosingRunner);
         this.step = stepContext.getStep();
@@ -95,11 +93,6 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
         } else {
             tm = jobContext.getBatchEnvironment().getTransactionManager();
         }
-
-        if (step.getProperties() != null) {
-            analyzerTxEnabled = !Boolean.parseBoolean(step.getProperties().get(PropertyKey.ANALYZER_TX_DISABLED));
-        }
-
         createStepListeners();
         initPartitionConfig();
     }
@@ -108,7 +101,6 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
     public void run() {
         final Boolean allowStartIfComplete = batchContext.getAllowStartIfComplete();
         if (allowStartIfComplete != Boolean.FALSE) {
-            boolean enterBeforeStep = false;
             try {
                 final List<String> executedStepIds = jobContext.getExecutedStepIds();
                 if (executedStepIds.contains(step.getId())) {
@@ -140,14 +132,24 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
                     return;
                 }
 
-                enterBeforeStep = true;
                 for (final StepListener l : stepListeners) {
                     l.beforeStep();
                 }
+
                 runBatchletOrChunk(batchlet, chunk);
 
                 //record the fact this step has been executed
                 executedStepIds.add(step.getId());
+
+                for (final StepListener l : stepListeners) {
+                    try {
+                        l.afterStep();
+                    } catch (final Throwable e) {
+                        BatchLogger.LOGGER.failToRunJob(e, jobContext.getJobName(), step.getId(), l);
+                        batchContext.setBatchStatus(BatchStatus.FAILED);
+                    }
+                }
+                batchContext.savePersistentData();
             } catch (final Throwable e) {
                 LOGGER.failToRunJob(e, jobContext.getJobName(), step.getId(), step);
                 if (e instanceof Exception) {
@@ -156,30 +158,13 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
                     batchContext.setException(new BatchRuntimeException(e));
                 }
                 batchContext.setBatchStatus(BatchStatus.FAILED);
-            } finally {
-                if (enterBeforeStep) {
-                    for (final StepListener l : stepListeners) {
-                        try {
-                            l.afterStep();
-                        } catch (final Throwable e) {
-                            BatchLogger.LOGGER.failToRunJob(e, jobContext.getJobName(), step.getId(), l);
-                            batchContext.setBatchStatus(BatchStatus.FAILED);
-                            if (batchContext.getException() != null) {
-                                batchContext.setException(new BatchRuntimeException(e));
-                            }
-                        }
-                    }
-                    batchContext.savePersistentData();
-                }
             }
 
             jobContext.destroyArtifact(mapper, reducer, analyzer);
             jobContext.destroyArtifact(stepListeners);
-            JobScopedContextImpl.ScopedInstance.destroy(batchContext.getScopedBeans());
 
-            switch (batchContext.getBatchStatus()) {
-                case COMPLETED:
-                    break;
+            final BatchStatus stepStatus = batchContext.getBatchStatus();
+            switch (stepStatus) {
                 case STARTED:
                     batchContext.setBatchStatus(BatchStatus.COMPLETED);
                     break;
@@ -193,28 +178,23 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
                     break;
             }
         }
-
         batchContext.getJobContext().getJobRepository().updateStepExecution(stepExecution);
-        batchContext.setTransientUserData(null);
 
-        switch (batchContext.getBatchStatus()) {
-            case COMPLETED:
-                final String next1 = resolveTransitionElements(step.getTransitionElements(), step.getAttributeNext(), false);
-                enclosingRunner.runJobElement(next1, stepExecution);
-                break;
-            case FAILED:
-                //transition elements can direct to the next job element even after the current step failed
-                final String next2 = resolveTransitionElements(step.getTransitionElements(), null, false);
-                if (next2 != null) {
-                    //check for possible loopback step
-                    if (!jobContext.getExecutedStepIds().contains(next2)) {
-                        for (final AbstractContext e : batchContext.getOuterContexts()) {
-                            e.setBatchStatus(BatchStatus.STARTED);
-                        }
-                        enclosingRunner.runJobElement(next2, stepExecution);
+        if (batchContext.getBatchStatus() == BatchStatus.COMPLETED) {
+            final String next = resolveTransitionElements(step.getTransitionElements(), step.getAttributeNext(), false);
+            enclosingRunner.runJobElement(next, stepExecution);
+        } else if (batchContext.getBatchStatus() == BatchStatus.FAILED) {
+            //transition elements can direct to the next job element even after the current step failed
+            final String next = resolveTransitionElements(step.getTransitionElements(), null, false);
+            if (next != null) {
+                //check for possible loopback step
+                if (!jobContext.getExecutedStepIds().contains(next)) {
+                    for (final AbstractContext e : batchContext.getOuterContexts()) {
+                        e.setBatchStatus(BatchStatus.STARTED);
                     }
+                    enclosingRunner.runJobElement(next, stepExecution);
                 }
-                break;
+            }
         }
     }
 
@@ -234,13 +214,13 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
         if (reducer != null) {
             reducer.beginPartitionedStep();
         }
+        final boolean isRestart = jobContext.isRestart();
         boolean isOverride = false;
         if (mapper != null) {
             final javax.batch.api.partition.PartitionPlan partitionPlan = mapper.mapPartitions();
             isOverride = partitionPlan.getPartitionsOverride();
             numOfPartitions = partitionPlan.getPartitions();
             numOfThreads = partitionPlan.getThreads();
-            numOfThreads = (numOfThreads == 0) ? numOfPartitions : numOfThreads;
             partitionProperties = partitionPlan.getPartitionProperties();
         } else {
             numOfPartitions = plan.getPartitionsInt();
@@ -252,49 +232,13 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
                 partitionProperties[idx] = org.jberet.job.model.Properties.toJavaUtilProperties(props);
             }
         }
-
-        final StepExecutionImpl originalStepExecution = batchContext.getOriginalStepExecution();
-        final boolean isStepRestart = originalStepExecution != null;
-        final boolean isRestartNotOverride = isStepRestart && !isOverride;
+        final boolean isRestartNotOverride = isRestart && !isOverride;
         List<PartitionExecutionImpl> abortedPartitionExecutionsFromPrevious = null;
         if (isRestartNotOverride) {
-            //need to carry over partition execution data from previous run of the same step.
-            //for crashed original step execution, some partitions might not have chance to run during the original
-            // job execution, and so should be added
-            final BatchStatus oldStatus = originalStepExecution.getBatchStatus();
-            final long oldStepExecutionId = originalStepExecution.getStepExecutionId();
-            if (oldStatus == BatchStatus.FAILED || oldStatus == BatchStatus.STOPPED || oldStatus == BatchStatus.COMPLETED) {
-                abortedPartitionExecutionsFromPrevious =
-                        jobContext.getJobRepository().getPartitionExecutions(oldStepExecutionId,
-                                originalStepExecution, true, jobContext.getClassLoader());
-            } else {  //the original step execution terminated abruptly
-                final List<PartitionExecutionImpl> partitionExecutionsFromPrevious =
-                        jobContext.getJobRepository().getPartitionExecutions(oldStepExecutionId,
-                                originalStepExecution, false, jobContext.getClassLoader());
-                abortedPartitionExecutionsFromPrevious = new ArrayList<PartitionExecutionImpl>();
-                if (numOfPartitions == partitionExecutionsFromPrevious.size()) {
-                    for (final PartitionExecutionImpl e : partitionExecutionsFromPrevious) {
-                        if (e.getBatchStatus() != BatchStatus.COMPLETED) {
-                            abortedPartitionExecutionsFromPrevious.add(e);
-                        }
-                    }
-                } else {
-                    final int[] coveredPartitions = new int[numOfPartitions];
-                    Arrays.fill(coveredPartitions, 0);
-                    for (final PartitionExecutionImpl e : partitionExecutionsFromPrevious) {
-                        coveredPartitions[e.getPartitionId()] = 1;
-                        if (e.getBatchStatus() != BatchStatus.COMPLETED) {
-                            abortedPartitionExecutionsFromPrevious.add(e);
-                        }
-                    }
-                    for (int i = 0; i < coveredPartitions.length; i++) {
-                        if (coveredPartitions[i] == 0) {
-                            abortedPartitionExecutionsFromPrevious.add(new PartitionExecutionImpl(i, oldStepExecutionId,
-                                    originalStepExecution.getStepName(), BatchStatus.FAILED, BatchStatus.FAILED.name(), null, null, null));
-                        }
-                    }
-                }
-            }
+            //need to carry over partition execution data from previous run of the same step
+            final StepExecutionImpl originalStepExecution = batchContext.getOriginalStepExecution();
+            abortedPartitionExecutionsFromPrevious =
+                    jobContext.getJobRepository().getPartitionExecutions(originalStepExecution.getStepExecutionId(), originalStepExecution, true);
             numOfPartitions = abortedPartitionExecutionsFromPrevious.size();
         }
         if (numOfPartitions > numOfThreads) {
@@ -331,7 +275,7 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
                 stepContext1.getStepExecution().setWriterCheckpointInfo(partitionExecution.getWriterCheckpointInfo());
             }
 
-            if (isStepRestart && isOverride && reducer != null) {
+            if (isRestart && isOverride && reducer != null) {
                 reducer.rollbackPartitionedStep();
             }
             final Chunk ch = step1.getChunk();
@@ -349,10 +293,7 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
 
         BatchStatus consolidatedBatchStatus = BatchStatus.STARTED;
         final List<PartitionExecutionImpl> fromAllPartitions = new ArrayList<PartitionExecutionImpl>();
-
-        if (analyzer != null && analyzerTxEnabled) {
-            tm.begin();
-        }
+        //tm.begin();
         try {
             while (fromAllPartitions.size() < numOfPartitions) {
                 final Serializable data = collectorDataQueue.take();
@@ -378,23 +319,24 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
                     }
 
                     if (analyzer != null) {
-                        analyzer.analyzeStatus(bs, s.getExitStatus());
+                    	tm.begin();
+                    	analyzer.analyzeStatus(bs, s.getExitStatus());
+                    	tm.commit();	
                     }
                 } else if (analyzer != null) {
-                    analyzer.analyzeCollectorData(data);
+                	tm.begin();
+                	analyzer.analyzeCollectorData(data);
+                	tm.commit();
                 }
             }
 
-            if (analyzer != null && analyzerTxEnabled &&
-                    (consolidatedBatchStatus == BatchStatus.FAILED || consolidatedBatchStatus == BatchStatus.STOPPED)) {
-                tm.rollback();
+            if (consolidatedBatchStatus == BatchStatus.FAILED || consolidatedBatchStatus == BatchStatus.STOPPED) {
+                //tm.rollback();
             } else {
                 if (reducer != null) {
                     reducer.beforePartitionedStepCompletion();
                 }
-                if (analyzer != null && analyzerTxEnabled) {
-                    tm.commit();
-                }
+                //tm.commit();
             }
             if (reducer != null) {
                 if (consolidatedBatchStatus == BatchStatus.FAILED || consolidatedBatchStatus == BatchStatus.STOPPED) {
@@ -405,18 +347,12 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
                 }
             }
         } catch (final Exception e) {
-            BatchLogger.LOGGER.failToRunJob(e, jobContext.getJobName(), step.getId(), step);
             consolidatedBatchStatus = BatchStatus.FAILED;
-
-            if (analyzer != null && analyzerTxEnabled) {
-                try {
-                    tm.rollback();
-                } catch (final Exception ee) {
-                    BatchLogger.LOGGER.tracef(ee, "Exception when rolling back transaction.");
-                }
-            }
             if (reducer != null) {
                 reducer.rollbackPartitionedStep();
+                if(tm.getStatus() != Status.STATUS_NO_TRANSACTION) {
+                	tm.rollback();
+                }
                 reducer.afterPartitionedStepCompletion(PartitionReducer.PartitionStatus.ROLLBACK);
             }
         }
@@ -439,6 +375,7 @@ public final class StepExecutionRunner extends AbstractRunner<StepContextImpl> i
             if (analyzerConfig != null) {
                 analyzer = jobContext.createArtifact(analyzerConfig.getRef(), null, analyzerConfig.getProperties(), batchContext);
             }
+            collectorConfig = partition.getCollector();
             plan = partition.getPlan();
         }
     }
